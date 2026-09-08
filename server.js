@@ -15,7 +15,7 @@ if (!fs.existsSync(tmpDescargasPath)) {
 }
 
 
-
+require("dotenv").config();
 const app = express();
 
 console.log("¡SERVIDOR INICIADO! Lógica de Pictogramas 1.2 Activa.");
@@ -246,7 +246,7 @@ async function generarPictogramaFinal(codigos, volumen) {
 const CLIENT_ID = '7453909704-o92g8sag1lievj61vbl9eqo3s549q0q0.apps.googleusercontent.com';
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const REFRESH_TOKEN = process.env.REFRESH_TOKEN;
-const REDIRECT_URI = 'http://127.0.0.1:5500';
+const REDIRECT_URI = process.env.REDIRECT_URI;
 
 const CARPETA_A_ID = "1JmCe_EzvVJxzNToko_MCPlgI5I6y-SP1";
 const PLANTILLA_DOC_ID = "1ivDHlSpkSvAOClVQTXP-gwKXe2N_q3oAL19GOeLVCuc";
@@ -421,11 +421,9 @@ async function subirPDFsPorCodigo(codigo, carpetaId, fabricante, modoReactivosPu
 
     console.log(`[PDF Drive] Código buscado: ${codigo}. Coincidencias exactas encontradas: ${coincidencias.length}`);
 
-    // Antes se copiaba un PDF a la vez (await dentro de un for). Como cada copia es
-    // independiente de las demás, lanzarlas todas juntas con Promise.all ahorra
-    // segundos cuando hay varios PDFs por código.
-    await Promise.all(coincidencias.map(async archivo => {
+    for (const archivo of coincidencias) {
         try {
+            // Copiar (no descargar/resubir) es mucho más rápido y no depende de tu disco local
             await drive.files.copy({
                 fileId: archivo.id,
                 requestBody: {
@@ -437,7 +435,7 @@ async function subirPDFsPorCodigo(codigo, carpetaId, fabricante, modoReactivosPu
         } catch (error) {
             console.error(`[PDF Drive] Error al copiar ${archivo.name}:`, error.message);
         }
-    }));
+    }
 }
 
 async function generarQR(idCarpeta) {
@@ -536,52 +534,30 @@ app.get("/api/reactivoPorCodigo/:codigo", async (req, res) => {
     }
 });
 
-app.post("/api/procesarCarpetaReactivo", async (req, res) => {
-    const { nombreReactivo, usuarioAnalista, fabricante, modoReactivosPuros } = req.body;
+// Guarda el estado del trabajo pesado (PDFs + documento) para cada carpeta,
+// así el frontend puede consultarlo con /api/estadoCarpeta/:idCarpeta si lo necesita.
+const estadosCarpeta = new Map();
 
-
-    const clave = generarClaveBloqueo(nombreReactivo, usuarioAnalista);
-    if (bloqueos.has(clave)) {
-        return res.status(429).json({
-            ok: false,
-            error: "Proceso ya en ejecución",
-            detalle: "Se rechazó una llamada duplicada para evitar múltiples carpetas."
-        });
-    }
-    bloqueos.set(clave, true);
-
+async function procesarPDFsYDocumentoEnSegundoPlano(idCarpeta, { info, codigos, usuarioAnalista, fabricante, modoReactivosPuros }) {
     try {
-        const ModeloBusqueda = modoReactivosPuros
-            ? ReactivosPuros
-            : InfoSoluciones;
-
-        const info = await ModeloBusqueda.findOne({
-            nombre: new RegExp(`^${nombreReactivo}$`, "i")
-        });
-
-        if (!info) return res.status(404).json({ error: "Reactivo no encontrado" });
-        const codigos = (info.indicaciones || "")
-            .split("y")
-            .map(c => c.trim())
-            .filter(c => c !== "");
-
-        const nombreCarpeta = generarNombreCarpetaUnico();
-
-        // Estas dos cosas no dependen una de la otra: buscar las frases H/P en Mongo
-        // y crear la carpeta en Drive. Antes se hacían en cascada; ahora corren juntas.
-        const [resultadosFrases, idCarpeta] = await Promise.all([
-            Promise.all(codigos.map(cod => Codigo.find({ codigo: cod }))),
-            crearCarpetaDentroDeA(nombreCarpeta)
-        ]);
-
         let frasesH = [];
         let frasesP = [];
-        resultadosFrases.flat().forEach(item => {
-            if (item.frases_h) frasesH.push(...item.frases_h);
-            if (item.frases_p) frasesP.push(...item.frases_p);
-        });
+
+        for (const cod of codigos) {
+            const reactivosEncontrados = await Codigo.find({ codigo: cod });
+            reactivosEncontrados.forEach(item => {
+                if (item.frases_h) frasesH.push(...item.frases_h);
+                if (item.frases_p) frasesP.push(...item.frases_p);
+            });
+        }
         frasesH = [...new Set(frasesH)];
         frasesP = [...new Set(frasesP)];
+
+        // Copiar los PDFs de cada código EN PARALELO en vez de uno por uno.
+        await Promise.all(
+            codigos.map(cod => subirPDFsPorCodigo(cod, idCarpeta, fabricante, modoReactivosPuros))
+        );
+
         const contenido = `
 REACTIVO: 
 
@@ -605,39 +581,82 @@ Dirección: Cra. 32B #22B - 29
 Teléfono: (601) 813 8530
 
 EN FUNCION DEL CUMPLIMIENTO DE TRAZABILIDAD SE DECLARA QUE LA SOLUCIÓN REENVASADA O MEZCLA PRESENTE EN EL ENVASE ETIQUETADO FUE REALIZADO POR EL ANALISTA AUTORIZADO: ${usuarioAnalista}
-    `;
+    `;
 
-        // Copiar y actualizar documento
-        // Estas tres tareas solo necesitan el idCarpeta y no dependen entre sí:
-        // subir los PDFs, generar el documento (copiar plantilla + poner negritas),
-        // y generar el QR (que ni siquiera necesita el documento). Antes se esperaban
-        // una por una y el tiempo total era la SUMA de las tres; en paralelo, el tiempo
-        // total es el de la más lenta, no la suma.
-        const [, docId, qrBase64] = await Promise.all([
-            Promise.all(codigos.map(cod => subirPDFsPorCodigo(cod, idCarpeta, fabricante, modoReactivosPuros))),
-            (async () => {
-                const id = await copiarYEditarArchivo(PLANTILLA_DOC_ID, idCarpeta, contenido);
-                await ponerTitulosEnNegrita(id);
-                return id;
-            })(),
-            generarQR(idCarpeta)
-        ]);
+        const docId = await copiarYEditarArchivo(PLANTILLA_DOC_ID, idCarpeta, contenido);
+        await ponerTitulosEnNegrita(docId);
 
+        estadosCarpeta.set(idCarpeta, { estado: "listo", docId });
+    } catch (err) {
+        console.error("Error en procesamiento en segundo plano:", err);
+        estadosCarpeta.set(idCarpeta, { estado: "error", error: err.message });
+    }
+}
+
+app.post("/api/procesarCarpetaReactivo", async (req, res) => {
+    const { nombreReactivo, usuarioAnalista, fabricante, modoReactivosPuros } = req.body;
+
+    const clave = generarClaveBloqueo(nombreReactivo, usuarioAnalista);
+    if (bloqueos.has(clave)) {
+        return res.status(429).json({
+            ok: false,
+            error: "Proceso ya en ejecución",
+            detalle: "Se rechazó una llamada duplicada para evitar múltiples carpetas."
+        });
+    }
+    bloqueos.set(clave, true);
+
+    try {
+        const ModeloBusqueda = modoReactivosPuros
+            ? ReactivosPuros
+            : InfoSoluciones;
+
+        const info = await ModeloBusqueda.findOne({
+            nombre: new RegExp(`^${nombreReactivo}$`, "i")
+        });
+
+        if (!info) return res.status(404).json({ error: "Reactivo no encontrado" });
+
+        const codigos = (info.indicaciones || "")
+            .split("y")
+            .map(c => c.trim())
+            .filter(c => c !== "");
+
+        // Solo lo indispensable para tener el QR: crear la carpeta.
+        const nombreCarpeta = generarNombreCarpetaUnico();
+        const idCarpeta = await crearCarpetaDentroDeA(nombreCarpeta);
+        const qrBase64 = await generarQR(idCarpeta);
+
+        // Responder YA con el QR. Lo pesado (copiar PDFs, crear y formatear
+        // el documento) sigue corriendo en segundo plano y no bloquea al usuario.
+        estadosCarpeta.set(idCarpeta, { estado: "procesando" });
         res.json({
             ok: true,
             carpetaId: idCarpeta,
-            docId,
             qr: qrBase64,
-            mensaje: "Carpeta creada, PDFs subidos y QR generado."
+            estado: "procesando",
+            mensaje: "Carpeta creada y QR generado. Los PDFs y el documento se están terminando de generar."
+        });
+
+        procesarPDFsYDocumentoEnSegundoPlano(idCarpeta, {
+            info, codigos, usuarioAnalista, fabricante, modoReactivosPuros
+        }).finally(() => {
+            bloqueos.delete(clave);
         });
 
     } catch (err) {
         console.error("Error procesarCarpetaReactivo:", err);
-        res.status(500).json({ error: "Error procesando carpeta y archivos" });
-
-    } finally {
         bloqueos.delete(clave);
+        res.status(500).json({ error: "Error procesando carpeta y archivos" });
     }
+});
+
+// Opcional: para que el frontend pueda consultar si ya terminó de armarse
+// el documento y los PDFs después de haber mostrado el QR.
+app.get("/api/estadoCarpeta/:idCarpeta", (req, res) => {
+    const estado = estadosCarpeta.get(req.params.idCarpeta);
+    if (!estado) return res.status(404).json({ error: "Carpeta no encontrada" });
+    res.json(estado);
 });
 
 app.post("/api/generarEtiqueta", async (req, res) => {
@@ -767,6 +786,7 @@ app.post("/api/generarDocumentoMultiples", generarMultiplesEtiquetas);
 module.exports = { InfoSoluciones, Codigo };
 
 const PORT = process.env.PORT || 4000;
+
 app.listen(PORT, () =>
     console.log(`Servidor corriendo en puerto ${PORT}`)
 );
