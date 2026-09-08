@@ -15,7 +15,7 @@ if (!fs.existsSync(tmpDescargasPath)) {
 }
 
 
-require("dotenv").config();
+
 const app = express();
 
 console.log("¡SERVIDOR INICIADO! Lógica de Pictogramas 1.2 Activa.");
@@ -46,7 +46,7 @@ app.use((req, res, next) => {
 
 app.use(
     cors({
-        origin: process.env.REDIRECT_URI,
+        origin: "*",
         methods: ["GET", "POST", "OPTIONS"],
         allowedHeaders: ["Content-Type", "ngrok-skip-browser-warning"],
         exposedHeaders: ["Content-Disposition"]
@@ -421,9 +421,11 @@ async function subirPDFsPorCodigo(codigo, carpetaId, fabricante, modoReactivosPu
 
     console.log(`[PDF Drive] Código buscado: ${codigo}. Coincidencias exactas encontradas: ${coincidencias.length}`);
 
-    for (const archivo of coincidencias) {
+    // Antes se copiaba un PDF a la vez (await dentro de un for). Como cada copia es
+    // independiente de las demás, lanzarlas todas juntas con Promise.all ahorra
+    // segundos cuando hay varios PDFs por código.
+    await Promise.all(coincidencias.map(async archivo => {
         try {
-            // Copiar (no descargar/resubir) es mucho más rápido y no depende de tu disco local
             await drive.files.copy({
                 fileId: archivo.id,
                 requestBody: {
@@ -435,7 +437,7 @@ async function subirPDFsPorCodigo(codigo, carpetaId, fabricante, modoReactivosPu
         } catch (error) {
             console.error(`[PDF Drive] Error al copiar ${archivo.name}:`, error.message);
         }
-    }
+    }));
 }
 
 async function generarQR(idCarpeta) {
@@ -562,25 +564,24 @@ app.post("/api/procesarCarpetaReactivo", async (req, res) => {
             .split("y")
             .map(c => c.trim())
             .filter(c => c !== "");
+
+        const nombreCarpeta = generarNombreCarpetaUnico();
+
+        // Estas dos cosas no dependen una de la otra: buscar las frases H/P en Mongo
+        // y crear la carpeta en Drive. Antes se hacían en cascada; ahora corren juntas.
+        const [resultadosFrases, idCarpeta] = await Promise.all([
+            Promise.all(codigos.map(cod => Codigo.find({ codigo: cod }))),
+            crearCarpetaDentroDeA(nombreCarpeta)
+        ]);
+
         let frasesH = [];
         let frasesP = [];
-
-        for (const cod of codigos) {
-            const reactivosEncontrados = await Codigo.find({ codigo: cod });
-
-            reactivosEncontrados.forEach(item => {
-                if (item.frases_h) frasesH.push(...item.frases_h);
-                if (item.frases_p) frasesP.push(...item.frases_p);
-            });
-        }
-
+        resultadosFrases.flat().forEach(item => {
+            if (item.frases_h) frasesH.push(...item.frases_h);
+            if (item.frases_p) frasesP.push(...item.frases_p);
+        });
         frasesH = [...new Set(frasesH)];
         frasesP = [...new Set(frasesP)];
-        const nombreCarpeta = generarNombreCarpetaUnico();
-        const idCarpeta = await crearCarpetaDentroDeA(nombreCarpeta);
-        for (const cod of codigos) {
-            await subirPDFsPorCodigo(cod, idCarpeta, fabricante, modoReactivosPuros);
-        }
         const contenido = `
 REACTIVO: 
 
@@ -607,13 +608,20 @@ EN FUNCION DEL CUMPLIMIENTO DE TRAZABILIDAD SE DECLARA QUE LA SOLUCIÓN REENVASA
     `;
 
         // Copiar y actualizar documento
-        const docId = await copiarYEditarArchivo(PLANTILLA_DOC_ID, idCarpeta, contenido);
-
-        await ponerTitulosEnNegrita(docId);
-
-
-        // Generar QR
-        const qrBase64 = await generarQR(idCarpeta);
+        // Estas tres tareas solo necesitan el idCarpeta y no dependen entre sí:
+        // subir los PDFs, generar el documento (copiar plantilla + poner negritas),
+        // y generar el QR (que ni siquiera necesita el documento). Antes se esperaban
+        // una por una y el tiempo total era la SUMA de las tres; en paralelo, el tiempo
+        // total es el de la más lenta, no la suma.
+        const [, docId, qrBase64] = await Promise.all([
+            Promise.all(codigos.map(cod => subirPDFsPorCodigo(cod, idCarpeta, fabricante, modoReactivosPuros))),
+            (async () => {
+                const id = await copiarYEditarArchivo(PLANTILLA_DOC_ID, idCarpeta, contenido);
+                await ponerTitulosEnNegrita(id);
+                return id;
+            })(),
+            generarQR(idCarpeta)
+        ]);
 
         res.json({
             ok: true,
@@ -758,8 +766,6 @@ app.post("/api/generarDocumentoEtiquetas", generarDocumentoEtiquetas);
 app.post("/api/generarDocumentoMultiples", generarMultiplesEtiquetas);
 module.exports = { InfoSoluciones, Codigo };
 
-const PORT = process.env.PORT || 4000;
-
-app.listen(PORT, () =>
-    console.log(`Servidor corriendo en puerto ${PORT}`)
+app.listen(4000, () =>
+    console.log("Servidor corriendo en http://localhost:4000")
 );
