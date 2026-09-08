@@ -766,7 +766,7 @@ app.post("/api/generarDocumentoEtiquetas", generarDocumentoEtiquetas);
 app.post("/api/generarDocumentoMultiples", generarMultiplesEtiquetas);
 module.exports = { InfoSoluciones, Codigo };
 
-Const PORT = process.env.PORT || 4000;
+const PORT = process.env.PORT || 4000;
 app.listen(PORT, () =>
     console.log(`Servidor corriendo en puerto ${PORT}`)
 );
