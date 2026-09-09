@@ -61,7 +61,7 @@ function obtenerDimensionesPorEnvase(envase) {
   }
 
   // Grupo 3
-  if (["10000","10l","20000","20l",,"30000","30l","40000","40l","50000","50l"].includes(v)) {
+  if (["10000","10l","20000","20l","30000","30l","40000","40l","50000","50l"].includes(v)) {
     console.log("➡ APLICADO GRUPO 3");
     return DIMENSIONES.grupo3;
   }
