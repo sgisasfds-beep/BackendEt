@@ -53,15 +53,17 @@ app.use(
     })
 );
 
-app.options("/api/generarDocumentoEtiquetas", (req, res) => {
-    res.header("Access-Control-Allow-Origin", process.env.REDIRECT_URI);
-    res.header("Access-Control-Allow-Methods", "POST, OPTIONS");
-    res.header("Access-Control-Allow-Headers", "Content-Type");
-    res.header("Access-Control-Expose-Headers", "Content-Disposition");
-    return res.sendStatus(204);
-});
-
 app.use(express.static(__dirname));
+
+// Evita el "Cannot GET /" al abrir el backend directamente y sirve como endpoint
+// para servicios de keep-alive (UptimeRobot, cron-job.org, etc.) que eviten que
+// Render "duerma" el servicio en el plan gratuito.
+app.get("/", (req, res) => {
+    res.status(200).send("Backend SafeLabel activo.");
+});
+app.get("/health", (req, res) => {
+    res.status(200).json({ ok: true, uptime: process.uptime() });
+});
 
 // Carpeta en Google Drive donde viven TODOS los PDFs (la "biblioteca").
 // Súbelos ahí una sola vez con migrarPDFsADrive.js y pon el ID de esa carpeta aquí.
@@ -534,30 +536,53 @@ app.get("/api/reactivoPorCodigo/:codigo", async (req, res) => {
     }
 });
 
-// Guarda el estado del trabajo pesado (PDFs + documento) para cada carpeta,
-// así el frontend puede consultarlo con /api/estadoCarpeta/:idCarpeta si lo necesita.
-const estadosCarpeta = new Map();
+app.post("/api/procesarCarpetaReactivo", async (req, res) => {
+    const { nombreReactivo, usuarioAnalista, fabricante, modoReactivosPuros } = req.body;
 
-async function procesarPDFsYDocumentoEnSegundoPlano(idCarpeta, { info, codigos, usuarioAnalista, fabricante, modoReactivosPuros }) {
+
+    const clave = generarClaveBloqueo(nombreReactivo, usuarioAnalista);
+    if (bloqueos.has(clave)) {
+        return res.status(429).json({
+            ok: false,
+            error: "Proceso ya en ejecución",
+            detalle: "Se rechazó una llamada duplicada para evitar múltiples carpetas."
+        });
+    }
+    bloqueos.set(clave, true);
+
     try {
+        const ModeloBusqueda = modoReactivosPuros
+            ? ReactivosPuros
+            : InfoSoluciones;
+
+        const info = await ModeloBusqueda.findOne({
+            nombre: new RegExp(`^${nombreReactivo}$`, "i")
+        });
+
+        if (!info) return res.status(404).json({ error: "Reactivo no encontrado" });
+        const codigos = (info.indicaciones || "")
+            .split("y")
+            .map(c => c.trim())
+            .filter(c => c !== "");
         let frasesH = [];
         let frasesP = [];
 
         for (const cod of codigos) {
             const reactivosEncontrados = await Codigo.find({ codigo: cod });
+
             reactivosEncontrados.forEach(item => {
                 if (item.frases_h) frasesH.push(...item.frases_h);
                 if (item.frases_p) frasesP.push(...item.frases_p);
             });
         }
+
         frasesH = [...new Set(frasesH)];
         frasesP = [...new Set(frasesP)];
-
-        // Copiar los PDFs de cada código EN PARALELO en vez de uno por uno.
-        await Promise.all(
-            codigos.map(cod => subirPDFsPorCodigo(cod, idCarpeta, fabricante, modoReactivosPuros))
-        );
-
+        const nombreCarpeta = generarNombreCarpetaUnico();
+        const idCarpeta = await crearCarpetaDentroDeA(nombreCarpeta);
+        for (const cod of codigos) {
+            await subirPDFsPorCodigo(cod, idCarpeta, fabricante, modoReactivosPuros);
+        }
         const contenido = `
 REACTIVO: 
 
@@ -581,82 +606,32 @@ Dirección: Cra. 32B #22B - 29
 Teléfono: (601) 813 8530
 
 EN FUNCION DEL CUMPLIMIENTO DE TRAZABILIDAD SE DECLARA QUE LA SOLUCIÓN REENVASADA O MEZCLA PRESENTE EN EL ENVASE ETIQUETADO FUE REALIZADO POR EL ANALISTA AUTORIZADO: ${usuarioAnalista}
-    `;
+    `;
 
+        // Copiar y actualizar documento
         const docId = await copiarYEditarArchivo(PLANTILLA_DOC_ID, idCarpeta, contenido);
+
         await ponerTitulosEnNegrita(docId);
 
-        estadosCarpeta.set(idCarpeta, { estado: "listo", docId });
-    } catch (err) {
-        console.error("Error en procesamiento en segundo plano:", err);
-        estadosCarpeta.set(idCarpeta, { estado: "error", error: err.message });
-    }
-}
 
-app.post("/api/procesarCarpetaReactivo", async (req, res) => {
-    const { nombreReactivo, usuarioAnalista, fabricante, modoReactivosPuros } = req.body;
-
-    const clave = generarClaveBloqueo(nombreReactivo, usuarioAnalista);
-    if (bloqueos.has(clave)) {
-        return res.status(429).json({
-            ok: false,
-            error: "Proceso ya en ejecución",
-            detalle: "Se rechazó una llamada duplicada para evitar múltiples carpetas."
-        });
-    }
-    bloqueos.set(clave, true);
-
-    try {
-        const ModeloBusqueda = modoReactivosPuros
-            ? ReactivosPuros
-            : InfoSoluciones;
-
-        const info = await ModeloBusqueda.findOne({
-            nombre: new RegExp(`^${nombreReactivo}$`, "i")
-        });
-
-        if (!info) return res.status(404).json({ error: "Reactivo no encontrado" });
-
-        const codigos = (info.indicaciones || "")
-            .split("y")
-            .map(c => c.trim())
-            .filter(c => c !== "");
-
-        // Solo lo indispensable para tener el QR: crear la carpeta.
-        const nombreCarpeta = generarNombreCarpetaUnico();
-        const idCarpeta = await crearCarpetaDentroDeA(nombreCarpeta);
+        // Generar QR
         const qrBase64 = await generarQR(idCarpeta);
 
-        // Responder YA con el QR. Lo pesado (copiar PDFs, crear y formatear
-        // el documento) sigue corriendo en segundo plano y no bloquea al usuario.
-        estadosCarpeta.set(idCarpeta, { estado: "procesando" });
         res.json({
             ok: true,
             carpetaId: idCarpeta,
+            docId,
             qr: qrBase64,
-            estado: "procesando",
-            mensaje: "Carpeta creada y QR generado. Los PDFs y el documento se están terminando de generar."
-        });
-
-        procesarPDFsYDocumentoEnSegundoPlano(idCarpeta, {
-            info, codigos, usuarioAnalista, fabricante, modoReactivosPuros
-        }).finally(() => {
-            bloqueos.delete(clave);
+            mensaje: "Carpeta creada, PDFs subidos y QR generado."
         });
 
     } catch (err) {
         console.error("Error procesarCarpetaReactivo:", err);
-        bloqueos.delete(clave);
         res.status(500).json({ error: "Error procesando carpeta y archivos" });
-    }
-});
 
-// Opcional: para que el frontend pueda consultar si ya terminó de armarse
-// el documento y los PDFs después de haber mostrado el QR.
-app.get("/api/estadoCarpeta/:idCarpeta", (req, res) => {
-    const estado = estadosCarpeta.get(req.params.idCarpeta);
-    if (!estado) return res.status(404).json({ error: "Carpeta no encontrada" });
-    res.json(estado);
+    } finally {
+        bloqueos.delete(clave);
+    }
 });
 
 app.post("/api/generarEtiqueta", async (req, res) => {
