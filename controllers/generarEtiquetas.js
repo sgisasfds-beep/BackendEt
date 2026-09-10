@@ -1,7 +1,6 @@
 console.log("ARCHIVO generarEtiquetas.js CARGADO (versión local, sin Google Drive/Docs)");
 
 const { obtenerDimensionesPorEnvase } = require("./dimensionesEtiquetas");
-const { construirDocumentoEtiquetas } = require("./docxEtiquetas");
 const docxImportado = require("./docxEtiquetas"); // Importamos todo el módulo para revisar
 
 console.log("🔍 LO QUE NODE ESTÁ IMPORTANDO DE docxEtiquetas:", docxImportado);
